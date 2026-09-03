@@ -4,19 +4,27 @@ Telegram-бот для корпоративной базы знаний ИТ-с�
 Стек: aiogram 3.x, режим polling, без БД и без ML.
 
 Логика:
-  - при старте сканируются все *.md файлы в папке скрипта (pathlib);
+  - при старте сканируются все *.md И *.docx файлы в папке скрипта (pathlib);
   - каждый файл разбирается на пункты регулярным выражением
     (форматы номеров: "1.", "1.2", а также markdown-заголовки "# 1.2");
+    для .docx источником "строк" служат абзацы документа (python-docx);
   - для каждого пункта хранится: номер, заголовок, полный текст
-    до следующего пункта, имя файла-источника;
-  - поиск по свободному тексту: запрос очищается от стоп-слов,
-    считается количество совпавших значимых слов + коэффициент
-    схожести difflib.SequenceMatcher, пункт возвращается при
-    combined_score > 1.15 и хотя бы одном общем слове;
+    до следующего пункта, имя файла-источника (в т.ч. .docx);
+  - поиск по свободному тексту ведётся сразу по всем документам —
+    запрос очищается от стоп-слов, считается количество совпавших
+    значимых слов + коэффициент схожести difflib.SequenceMatcher,
+    пункт возвращается при combined_score > 1.15 и хотя бы одном
+    общем слове. Найденный пункт всегда указывает конкретный
+    документ-источник, из которого он взят — так бот "выбирает"
+    нужный документ среди множества .docx/.md файлов;
   - ответ форматируется в HTML: экранирование html.escape,
     затем упрощённый markdown (**bold**, *italic*) конвертируется в HTML-теги.
 
 Токен бота берётся из переменной окружения BOT_TOKEN (в коде его нет).
+
+Зависимости (requirements.txt):
+    aiogram>=3.4,<4.0
+    python-docx>=1.1,<2.0
 """
 
 import asyncio
@@ -40,6 +48,11 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
+
+try:
+    from docx import Document  # пакет python-docx, импортируется как "docx"
+except ImportError:  # pragma: no cover - подсказка на случай отсутствия зависимости
+    Document = None
 
 # ---------------------------------------------------------------------------
 # Логирование
@@ -113,27 +126,23 @@ class KBItem:
 
 
 KB_ITEMS: List[KBItem] = []
-MD_FILES: List[Path] = []
+KB_FILES: List[Path] = []  # все документы-источники: .md и .docx
 
 # Строка вида "1.", "1.2", "10.1.2", а также markdown-заголовок "# 1.2 ..."
 ITEM_START_RE = re.compile(r"^#{0,6}\s*(\d+(?:\.\d+)*)\.?\s+(.*)$")
 WORD_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
 
 
-def parse_md_file(path: Path) -> List[KBItem]:
-    """Разбирает один .md файл на пункты по номерам."""
-    try:
-        content = path.read_text(encoding="utf-8")
-    except Exception:
-        logger.exception("Не удалось прочитать файл: %s", path)
-        return []
-
+def parse_lines_into_items(lines: List[str], source_filename: str) -> List[KBItem]:
+    """Общий разборщик: превращает список текстовых строк документа
+    (не важно, откуда они — .md или абзацы .docx) в список пунктов KBItem
+    по номерам вида "1.", "1.2" или markdown-заголовку "# 1.2"."""
     items: List[KBItem] = []
     current_number: Optional[str] = None
     current_title: str = ""
     current_lines: List[str] = []
 
-    for raw_line in content.splitlines():
+    for raw_line in lines:
         line = raw_line.strip()
         match = ITEM_START_RE.match(line)
         if match:
@@ -143,7 +152,7 @@ def parse_md_file(path: Path) -> List[KBItem]:
                         number=current_number,
                         title=current_title.strip(),
                         text="\n".join(current_lines).strip(),
-                        source_file=path.name,
+                        source_file=source_filename,
                     )
                 )
             current_number = match.group(1)
@@ -159,29 +168,80 @@ def parse_md_file(path: Path) -> List[KBItem]:
                 number=current_number,
                 title=current_title.strip(),
                 text="\n".join(current_lines).strip(),
-                source_file=path.name,
+                source_file=source_filename,
             )
         )
 
     return items
 
 
-def load_knowledge_base() -> None:
-    """Сканирует папку скрипта на .md файлы и наполняет KB_ITEMS."""
-    global KB_ITEMS, MD_FILES
+def parse_md_file(path: Path) -> List[KBItem]:
+    """Разбирает один .md файл на пункты по номерам."""
+    try:
+        content = path.read_text(encoding="utf-8")
+    except Exception:
+        logger.exception("Не удалось прочитать файл: %s", path)
+        return []
 
-    MD_FILES = sorted(BASE_DIR.glob("*.md"))
-    if not MD_FILES:
-        logger.warning("В папке %s не найдено ни одного .md файла", BASE_DIR)
+    return parse_lines_into_items(content.splitlines(), path.name)
+
+
+def parse_docx_file(path: Path) -> List[KBItem]:
+    """Разбирает один .docx файл на пункты по номерам.
+
+    Каждый абзац Word-документа (paragraph.text) обрабатывается как
+    отдельная "строка" — так же, как строки .md файла. Это значит,
+    что номер пункта (например, "1.2 Название") должен быть написан
+    в тексте самого абзаца — точно как обычный текст."""
+    if Document is None:
+        logger.error(
+            "Библиотека python-docx не установлена — файл %s пропущен. "
+            "Установите: pip install python-docx",
+            path,
+        )
+        return []
+
+    try:
+        document = Document(str(path))
+    except Exception:
+        logger.exception("Не удалось открыть .docx файл: %s", path)
+        return []
+
+    lines = [paragraph.text for paragraph in document.paragraphs]
+    return parse_lines_into_items(lines, path.name)
+
+
+def load_knowledge_base() -> None:
+    """Сканирует папку скрипта на .md и .docx файлы и наполняет KB_ITEMS."""
+    global KB_ITEMS, KB_FILES
+
+    md_paths = list(BASE_DIR.glob("*.md"))
+    docx_paths = list(BASE_DIR.glob("*.docx"))
+    KB_FILES = sorted(md_paths + docx_paths, key=lambda p: p.name.lower())
+
+    if not KB_FILES:
+        logger.warning(
+            "В папке %s не найдено ни одного .md или .docx файла", BASE_DIR
+        )
 
     all_items: List[KBItem] = []
-    for md_path in MD_FILES:
-        file_items = parse_md_file(md_path)
-        logger.info("Файл %s: найдено пунктов — %d", md_path.name, len(file_items))
+    for file_path in KB_FILES:
+        if file_path.suffix.lower() == ".docx":
+            file_items = parse_docx_file(file_path)
+        else:
+            file_items = parse_md_file(file_path)
+
+        logger.info(
+            "Файл %s: найдено пунктов — %d", file_path.name, len(file_items)
+        )
         all_items.extend(file_items)
 
     KB_ITEMS = all_items
-    logger.info("Всего загружено пунктов базы знаний: %d", len(KB_ITEMS))
+    logger.info(
+        "Всего загружено документов: %d, пунктов базы знаний: %d",
+        len(KB_FILES),
+        len(KB_ITEMS),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +340,7 @@ HELP_TEXT = (
     "Что я умею:\n"
     "• /start — приветствие и меню\n"
     "• /help — эта инструкция\n"
-    "• /reglament — прислать все документы базы знаний (.md файлы)\n"
+    "• /reglament — прислать все документы базы знаний (.md и .docx)\n"
     "• Просто напишите вопрос своими словами — я найду подходящий пункт "
     "и укажу документ и номер пункта.\n\n"
     "Если подходящего пункта нет, я так и скажу, а не буду ничего придумывать."
@@ -323,27 +383,29 @@ async def cmd_search_help(message: Message):
 @router.message(Command("reglament"))
 @router.message(F.text == BTN_REGLAMENT)
 async def cmd_reglament(message: Message):
-    if not MD_FILES:
-        logger.error("Запрос регламента, но .md файлы не найдены в %s", BASE_DIR)
+    if not KB_FILES:
+        logger.error(
+            "Запрос регламента, но .md/.docx файлы не найдены в %s", BASE_DIR
+        )
         await message.answer(
             "Документы базы знаний сейчас недоступны. Сообщите администратору.",
             reply_markup=main_kb,
         )
         return
 
-    for md_path in MD_FILES:
-        if not md_path.exists():
-            logger.error("Файл пропал с диска: %s", md_path)
+    for file_path in KB_FILES:
+        if not file_path.exists():
+            logger.error("Файл пропал с диска: %s", file_path)
             continue
         try:
             await message.answer_document(
-                FSInputFile(md_path),
-                caption=md_path.name,
+                FSInputFile(file_path),
+                caption=file_path.name,
             )
         except Exception:
-            logger.exception("Не удалось отправить файл: %s", md_path)
+            logger.exception("Не удалось отправить файл: %s", file_path)
             await message.answer(
-                f"Не получилось отправить файл {html.escape(md_path.name)}.",
+                f"Не получилось отправить файл {html.escape(file_path.name)}.",
             )
 
 
