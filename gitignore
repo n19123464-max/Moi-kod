@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# Виртуальные окружения
+venv/
+.venv/
+env/
+
+# Переменные окружения / секреты
+.env
+
+# IDE
+.idea/
+.vscode/
+
+# Логи
+*.log
